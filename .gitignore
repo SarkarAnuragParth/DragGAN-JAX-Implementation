@@ -1,0 +1,5 @@
+﻿docs/thought-dump.md
+.vscode/
+**/__pycache__/**
+weights/**
+models/**
