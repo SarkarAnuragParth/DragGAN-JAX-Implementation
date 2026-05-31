@@ -1,12 +1,16 @@
+from jax import Array, config
+import os
+config.update("jax_compilation_cache_dir", os.path.join(os.path.dirname(__file__), ".jax_cache"))
 from flaxmodels.stylegan2.generator import MappingNetwork, SynthesisBlock, RESOLUTION
 import jax.random as jrndm
-from jax import Array
 from jax.numpy import ones, repeat, array as jarray, float32 as jf32, max as jmax, min as jmin
-from flax.nnx import Rngs, Module, state
-from flax.nnx import bridge
+from flax.nnx import Rngs, Module, state, jit as njit
+from flax.nnx import bridge, List as nnxlist
 from h5py import File
 from numpy import clip, uint8
 from PIL import Image
+from functools import partial
+
 
 
 mapping_network = MappingNetwork(pretrained='ffhq',ckpt_dir='weights')
@@ -97,25 +101,25 @@ build(w)
 class StyleGAN_Generator(Module):
     def __init__(self, noise_mode:str = 'random'):
         self.mapping_network = nnx_mapping_network
-        self.outputs_list = []
         self.const = param_dict['const'][()]
         self.noise_mode = noise_mode
+        self.blocks = nnxlist(blocks_list)
         
-    
     def __call__(self, z: Array, cutoff = None, rng = None):
+        outputs_list = []
         if rng is None:
             rng = jrndm.PRNGKey(42)
         w = self.mapping_network(z)
         x = self.const
         x = repeat(x, repeats=z.shape[0], axis=0)
         y = None
-        for i,layer in enumerate(blocks_list):
+        for i,layer in enumerate(self.blocks):
             if cutoff and i >= cutoff:
                 break  
             x, y = layer(x, y, w, self.noise_mode, rng)
-            self.outputs_list.append(x)
+            outputs_list.append(x)
             
-        return y, self.outputs_list
+        return y, outputs_list
     
 generator_ = StyleGAN_Generator()
 
@@ -125,12 +129,12 @@ if __name__ =='__main__':
     rng = jrndm.PRNGKey(42)
     latent_code = jrndm.normal(rng, (3, 512))
 
-    generated_images = (generator_(latent_code))[0]
+    # generated_images = (generator_(latent_code))[0]
 
-    images = (generated_images - jmin(generated_images)) / (jmax(generated_images) - jmin(generated_images))
+    # images = (generated_images - jmin(generated_images)) / (jmax(generated_images) - jmin(generated_images))
 
-    for i in range(images.shape[0]):
-        Image.fromarray(uint8(images[i] * 255)).save(f'image_{i}.jpg')
+    # for i in range(images.shape[0]):
+    #     Image.fromarray(uint8(images[i] * 255)).save(f'image_{i}.jpg')
     # state = state(model_)
     # checkpointer = ocp.PyTreeCheckpointer()
     # checkpointer.save('C:/Users/anura/DragGAN-JAX/models/ffhq_styleGAN', state)

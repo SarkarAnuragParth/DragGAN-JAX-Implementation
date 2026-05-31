@@ -1,25 +1,22 @@
 import jax.random as jrndm
-from jax.numpy import max as jmax, min as jmin
+from jax.numpy import max as jmax, min as jmin, mean as jmean, median as jmedian
 from flax.nnx import eval_shape, split, merge
-from PIL import Image
+from PIL import Image 
 from numpy import uint8
-from src.build_nnx_generator import StyleGAN_Generator
+from src.build_nnx_generator import generator_
 import orbax.checkpoint as ocp
 
 print("Finished importing files")
 
-checkpointer = ocp.PyTreeCheckpointer()
-abstract_model = eval_shape(lambda: StyleGAN_Generator())
-graphdef, abstract_state = split(abstract_model)
-state_restored = checkpointer.restore(r'C:/Users/anura/DragGAN-JAX/models/ffhq_styleGAN', abstract_state)
-nnx_generator = merge(graphdef, state_restored)
 
-rng = jrndm.random.PRNGKey(0)
-latent_code = jrndm.random.normal(rng, (3, 512))
+rng = jrndm.PRNGKey(42)
+batch_size = 3
+latent_code = jrndm.normal(rng, (batch_size, 512))
+generated_images, feature_maps = generator_(latent_code)
 
-generated_images = nnx_generator(latent_code)
-
-images = (generated_images - jmin(generated_images)) / (jmax(generated_images) - jmin(generated_images))
-
-for i in range(images.shape[0]):
-    Image.fromarray(uint8(images[i] * 255)).save(f'image_{i}.jpg')
+for j in range(batch_size):
+    for i,fm in enumerate(feature_maps):
+        print(jmax(fm[j]), jmin(fm[j]))
+        grayscaled_feature_map = jmin(fm[j], axis = -1)
+        normalized_grfm = (grayscaled_feature_map - jmin(grayscaled_feature_map))/(jmax(grayscaled_feature_map) - jmin(grayscaled_feature_map))
+        Image.fromarray(uint8(normalized_grfm * 255), mode='L').save(f'Min_image_{j+1}__feature_map_{i+1}.jpg')
