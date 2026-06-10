@@ -1,8 +1,6 @@
 import cv2
 
 
-
-    
 def get_drag_points(image_input):
     """
     Displays an image and allows the user to select a handle point and a target point.
