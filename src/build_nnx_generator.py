@@ -9,10 +9,11 @@ from h5py import File
 from numpy import clip, uint8
 from PIL import Image
 from functools import partial
+from typing import Optional
 
 dataset = 'afhqdog'
-param_dict = File(rf'weights/flaxmodels/stylegan2_generator_{dataset}.h5','r')['synthesis_network']
 
+param_dict = File(rf'weights/flaxmodels/stylegan2_generator_{dataset}.h5','r')['synthesis_network']
 #@njit
 def build_mapping_network():
     mapping_network = MappingNetwork(pretrained=dataset,ckpt_dir='weights')
@@ -41,18 +42,18 @@ def build(rng:jrndm.PRNGKey = None):
     fmap_decay: int=1
     fmap_min: int=1
     fmap_max: int=512
-    fmap_const: int=None
+    # fmap_const: Optional[int]=None
     activation = 'leaky_relu'
     dtype: str='float32'
     use_noise: bool=True
     resample_kernel: tuple=(1, 3, 3, 1)
     fused_modconv: bool=False
     num_fp16_res: int=0
-    clip_conv: float=None
+    clip_conv: Optional[float]=None
     blocks_list = []
     latent_code = jrndm.normal(jrndm.PRNGKey(0), (1, 512))
     nnx_mapping_network = build_mapping_network()
-    dlatents_in = nnx_mapping_network(latent_code)
+    dlatents_in = nnx_mapping_network(latent_code, skip_w_avg_update=True)
     resolution = RESOLUTION[dataset]
     
     if rng is None:
@@ -60,15 +61,11 @@ def build(rng:jrndm.PRNGKey = None):
     resolution_log2 = log2(resolution).astype(int)
     #assert resolution == int(2 ** resolution_log2) and resolution >= 4
     def nf(stage): return clip(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_min, fmap_max)
-    
-    num_layers = resolution_log2 * 2 - 2
-    
-    fmaps = fmap_const if fmap_const is not None else nf(1)
+
     
     # if param_dict is None:
     #     const = jrndm.normal(rng, (1, 4, 4, fmaps), dtype=dtype)
-    # else:
-    const = jarray(param_dict['const'], dtype=dtype)
+
     x = param_dict['const'][()]
     x = repeat(x, repeats=dlatents_in.shape[0], axis=0)
     y = None
@@ -100,11 +97,12 @@ def build(rng:jrndm.PRNGKey = None):
 
 class StyleGAN_Generator(Module):
     def __init__(self, noise_mode:str = 'random'):
-        self.const = param_dict['const'][()]
         self.noise_mode = noise_mode
         self.blocks = build()
+        self.const = param_dict['const'][()]
         self.resolution = RESOLUTION[dataset]
-        
+    
+    @njit(static_argnames='cutoff')  
     def __call__(self, w: Array, cutoff = None, rng = None):
         if rng is None:
             rng = jrndm.PRNGKey(42)
@@ -115,7 +113,6 @@ class StyleGAN_Generator(Module):
             if cutoff and i >= cutoff:
                 return x
             x, y = layer(x, y, w, self.noise_mode, rng)
-            
         return y
     
 
