@@ -1,163 +1,209 @@
-import time
-start = time.time()
-import jax.numpy as jnp
+from style_gan2_generator import MappingNetwork, SynthesisNetwork
 import jax
-from build_nnx_generator import build_mapping_network, StyleGAN_Generator
-print("Finished importing - Generator at time - ", time.time() - start)
-import jax.random as jrndm
+import time
 import utils
+import jax.numpy as jnp
+import jax.random as jrndm
 from flax import nnx
 import optax
 import numpy as np
 from PIL import Image
-print("Finished importing other things at - ", time.time() - start)
+import pickle as pkl
+
 
 class DragGan(nnx.Module):
-    def __init__(self):
-        self.mapping_network = build_mapping_network()
-        self.synthesis_network = StyleGAN_Generator()
-        self.cutoff_block = 8
+    def __init__(self, feature_map = 6, w_cutoff = 6, pretrained_dataset = 'ffhq'):
+        param_dict = utils.get_file(rf'weights/flaxmodels/stylegan2_generator_{pretrained_dataset}.h5')
+        self.mapping_network = MappingNetwork(pretrained = pretrained_dataset, param_dict=param_dict['mapping_network'])
+        self.synthesis_network = SynthesisNetwork(pretrained_dataset= pretrained_dataset, param_dict=param_dict['synthesis_network'])
+        self.cutoff_block = feature_map
         self.resolution = self.synthesis_network.resolution
         self.cache = {}
-        
-    def get_dlatent_loss(self, w_code, pi, ti, r1 = None):
+        self.lamda = 20
+        self.w_cutoff = w_cutoff
+
+    def get_dlatent_loss(self, w_code, P, T, mask, offsets):
+
         feature_map = self.synthesis_network(w_code, cutoff = self.cutoff_block)
-        loss = self.motion_supervision_loss(feature_map, pi, ti, r1)
-        return loss, feature_map
-        
-    def optimise_dlatent_single_it(self, optimizer: optax.GradientTransformationExtraArgs, opt_state, w_code, pi, ti, r1 = None):
-        (loss, feature_map), grads = nnx.value_and_grad(DragGan.get_dlatent_loss, 
-                                                        argnums = 1, 
-                                                        has_aux = True)(self, w_code, pi, ti, r1)
-        updates, opt_state = optimizer.update(grads, opt_state)
-        w_code = optax.apply_updates(w_code, updates)
-        
-        self.cache[f'feature_map_{self.cutoff_block}_block_old'] = feature_map
-        
-        return loss, w_code, opt_state
-    
-    
-    def generate_image(self, rng = None):
+        resized_map = jax.image.resize(feature_map, shape=(feature_map.shape[0], self.resolution, self.resolution, feature_map.shape[-1]), method="bilinear")
+        loss = self.motion_supervision_loss(resized_map, P, T, offsets)
+        C = resized_map.shape[-1]
+        mask_loss = jnp.linalg.norm((resized_map[0] - self.resized_original_feature_map[0])*mask, ord= 1, axis = -1 )
+        final_loss = loss + self.lamda*jnp.sum(mask_loss)/(jnp.sum(mask)*C + 1e-8)
+        return final_loss
+
+
+    @nnx.jit(static_argnames=['optimizer'])
+    def optimise_dlatent_single_it(self, optimizer: optax.GradientTransformationExtraArgs, opt_state, w_code, P, T, mask, offsets):
+
+        loss, grads = nnx.value_and_grad(DragGan.get_dlatent_loss,
+                                                        argnums = 1,
+                                                        has_aux = False)(self, w_code, P, T, mask, offsets)
+        updates, new_opt_state = optimizer.update(grads, opt_state)
+        new_w_code = optax.apply_updates(w_code, updates)
+        cleaned_w_code = new_w_code.at[:,self.w_cutoff:,:].set(w_code[:,self.w_cutoff:,:])
+        return loss, cleaned_w_code, new_opt_state
+
+
+    def generate_image(self, truncation_psi, rng = None):
         if rng is None:
             rng = jrndm.PRNGKey(42)
-            
+
         latent_code = jrndm.normal(rng, (1, 512))
-        w_code = self.mapping_network(latent_code, skip_w_avg_update=True)
+        w_code = self.mapping_network(latent_code, truncation_psi=truncation_psi)
         generated_images = (self.synthesis_network(w_code))[0]
         image = (generated_images - jnp.min(generated_images)) / (jnp.max(generated_images) - jnp.min(generated_images))
         image = np.array(image)
         image = np.clip(image * 255, 0, 255).astype(np.uint8)
         return image, w_code
-    
-    
-    def get_boundaries(self, pi, r):
-        x_min_b = -min(r,pi[0])
-        x_max_b = min(r, self.resolution - pi[0])
-        y_min_b = -min(r, pi[1])
-        y_max_b = min(r, self.resolution - pi[1])
-        return x_min_b, x_max_b, y_min_b, y_max_b
+
+
+    def bilinear_interpolate(self, feature_map, qi_x, qi_y, di_x, di_y):
+
+        xp = qi_x + di_x[:,None,None]
+        yp = qi_y + di_y[:,None,None]
+
+        x_low = jnp.floor(xp).astype(jnp.int32)
+        y_low = jnp.floor(yp).astype(jnp.int32)
+        x_high = jnp.clip(x_low + 1, 0, self.resolution)
+        y_high = jnp.clip(y_low + 1, 0, self.resolution)
+        x_low = jnp.clip(x_low, 0, self.resolution)
+        y_low = jnp.clip(y_low, 0, self.resolution)
+
+        fx = jnp.clip(xp - jnp.floor(xp), 0., 1.)[:,:,:,None]
+        fy = jnp.clip(yp - jnp.floor(yp), 0., 1.)[:,:,:,None]
+
+        v00 = feature_map[0, x_low, y_low,:]
+        v10 = feature_map[0, x_high, y_low,:]
+        v01 = feature_map[0, x_low, y_high,:]
+        v11 = feature_map[0, x_high, y_high,:]
+
+        return v00*(1-fx)*(1-fy) + v10*fx*(1-fy) + v01*(1-fx)*fy + v11*fx*fy
+
+
+    @nnx.jit
+    def motion_supervision_loss(self, resized_map, P, T,offsets):
         
-    def get_value_by_bilinear_interpolation(self, feature_map, qi, di):
-        xp = qi[0] + di[0]
-        yp = qi[1] + di[1]
-        x_low = int(xp)
-        x_upper = jnp.ceil(xp).astype(int)
-        y_low = int(yp)
-        y_upper = jnp.ceil(yp).astype(int)
-        R1 = feature_map[(0,x_low,y_low)]*(x_upper - xp) + feature_map[(0,x_upper, y_low)]*(xp - x_low)
-        R2 = feature_map[(0,x_low,y_upper)]*(x_upper - xp) + feature_map[(0,x_upper, y_upper)]*(xp - x_low)
-        return R1*(y_upper - yp) + R2*(yp - y_low)
+        n_points = P.shape[0]
+        P_x, P_y = P[:,0], P[:,1]
         
-    
-    def motion_supervision_loss(self, feature_map, pi: tuple, ti:tuple, r1 = None):
-        resized_map = jax.image.resize(feature_map, shape=(feature_map.shape[0], self.resolution, self.resolution, feature_map.shape[-1]), method="bilinear")
-        if not r1:
-            r1 = (3*self.resolution)//512
+        grid_x, grid_y = jnp.meshgrid(offsets, offsets, indexing='ij')
 
-        # if len(pi) != 2 or len(ti) != 2:
-        #     raise ValueError(f"Expected args pi and ti to be tuples of len 2. Got tuples of length {len(pi)} and {len(ti)} instead")
+        denominators = jnp.sqrt(jnp.square(T[:,0] - P[:,0]) + jnp.square(T[:,1] - P[:,1]) + 1e-8)
+        d_x = (T[:,0] - P[:,0])*(1/denominators)
+        d_y = (T[:,1] - P[:,1])*(1/denominators)
+        # jax.debug.print("d_x: {}", d_x)
+        # jax.debug.print("d_y: {}", d_y)
+        grid_x_3d = jnp.repeat(jnp.expand_dims(grid_x, axis = 0),n_points, axis=0)
+        grid_y_3d = jnp.repeat(jnp.expand_dims(grid_y, axis = 0),n_points, axis=0)
 
-        x_min_b, x_max_b, y_min_b, y_max_b = self.get_boundaries(pi, r1)
-        loss = 0
-        denominator = ((ti[0] - pi[0])**2 + (ti[1] - pi[1])**2)**0.5
-        di = ((ti[0] - pi[0])/denominator, (ti[1] - pi[1])/denominator)
+        curr_x = P_x[:,None,None] + grid_x_3d
+        curr_y = P_y[:,None,None] + grid_y_3d
 
-        for j in range(x_min_b, x_max_b, 1):
-            for i in range(y_min_b, y_max_b, 1):
-                detached_point = jax.lax.stop_gradient(resized_map[(0,pi[0]+j, pi[1]+i)])
-                target_point = self.get_value_by_bilinear_interpolation(resized_map, (pi[0]+j, pi[1]+i), di)
-                loss += jnp.linalg.norm(detached_point - target_point, ord = 1)
-        return loss
+        is_valid = (curr_x >= 0) & (curr_x < self.resolution) & \
+                (curr_y >= 0) & (curr_y < self.resolution)
 
+        safe_x = jnp.clip(curr_x, 0, self.resolution - 1)
+        safe_y = jnp.clip(curr_y, 0, self.resolution - 1)
+        #after here
+        ref_points = resized_map[0, safe_x, safe_y, :]
+        detached_points = jax.lax.stop_gradient(ref_points)
+        target_points = self.bilinear_interpolate(resized_map, safe_x, safe_y, d_x, d_y)
+        # target_points = jnp.array(target_points, dtype = jnp.float32)
+        losses = jnp.linalg.norm(detached_points - target_points, ord=1, axis=-1)
+        losses = jnp.where(is_valid, losses, 0.0)
 
-    def point_tracking(self, new_w, pi, r2 = None):
-        if r2 is None:
-            r2 = (12*self.resolution)//512
-        new_feature_map = self.synthesis_network(new_w, cutoff = self.cutoff_block)
-        old_feature_map = self.cache[f'feature_map_{self.cutoff_block}_block_old']
-        pre = time.time()
-        resized_old_feature_map = jax.image.resize(old_feature_map, shape=(old_feature_map.shape[0], self.resolution, self.resolution, old_feature_map.shape[-1]), method="bilinear")
-        #print("Time taken for resizing in point tracking - ", time.time() - pre)
-        old_point = resized_old_feature_map[(0,pi[0],pi[1])]
+        return jnp.sum(losses)
+
+    @nnx.jit
+    def point_tracking(self, new_feature_map, P, old_points, offsets, r2):
+
+        resized_new = jax.image.resize(
+            new_feature_map,
+            shape=(new_feature_map.shape[0], self.resolution, self.resolution, new_feature_map.shape[-1]),
+            method="bilinear"
+        )
+        n_points = P.shape[0]
+        P_x, P_y = P[:,0], P[:,1]
         
-        resized_new_feature_map = jax.image.resize(new_feature_map, shape=(new_feature_map.shape[0], self.resolution, self.resolution, new_feature_map.shape[-1]), method="bilinear")
-        x_min_b, x_max_b, y_min_b, y_max_b = self.get_boundaries(pi, r2)
-        min_ = float('inf')
-        x_new, y_new = None, None
-        for j in range(x_min_b, x_max_b, 1):
-            for i in range(y_min_b, y_max_b, 1):
-                nrm = jnp.linalg.norm(resized_new_feature_map[(0,pi[0]+j, pi[1]+i)] - old_point, ord=1)
-               
-                #print(f" Min:{min_}   New point: {jnp.linalg.norm(resized_new_feature_map[(0,pi[0]+j, pi[1]+i)], ord=1)}     old point: {jnp.linalg.norm(old_point,ord=1)}     x,y: {(pi[0] + j, pi[1] + i)}")
-                if min_ > nrm:
-                    min_ = nrm
-                    x_new, y_new = j, i
+        grid_x, grid_y = jnp.meshgrid(offsets, offsets, indexing='ij')
+        grid_x_3d = jnp.repeat(jnp.expand_dims(grid_x, axis = 0),n_points, axis=0)
+        grid_y_3d = jnp.repeat(jnp.expand_dims(grid_y, axis = 0),n_points, axis=0)
 
-        x_new_abs, y_new_abs = x_new + pi[0], y_new + pi[1]
-        return (x_new_abs, y_new_abs)
-                
+        curr_x = P_x[:,None,None] + grid_x_3d
+        curr_y = P_y[:,None,None] + grid_y_3d
+        is_valid = (curr_x >= 0) & (curr_x < self.resolution) & \
+                (curr_y >= 0) & (curr_y < self.resolution)
 
-    
-    def loop(self, code_handles_in = None, rng = None):
-        image, w_code = self.generate_image(rng)
-        print("Generated image at - ", time.time() - start)
-        if not code_handles_in:
-            pi, ti = utils.get_drag_points(image)
+        safe_x = jnp.clip(curr_x, 0, self.resolution - 1)
+        safe_y = jnp.clip(curr_y, 0, self.resolution - 1)
+        patch_features = resized_new[0, safe_x, safe_y, :]
+        distances = jnp.linalg.norm(patch_features - old_points[:, None, None, :], ord=1, axis=-1)
+        distances = jnp.where(is_valid, distances, jnp.inf)
+        min_flat_idx = distances.reshape(n_points, -1).argmin(axis=1)
+        rows, cols = jnp.unravel_index(min_flat_idx, (2*r2+1, 2*r2+1))
+
+        return P + jnp.array((rows - r2,cols - r2)).transpose()
+
+
+    @nnx.jit
+    def distance_less_than_threshold(self, P, T, threshold):
+        return jnp.all((jnp.abs(P[:,0] - T[:,0]) + jnp.abs(P[:,1] - T[:,1])) < threshold)
+
+
+    def loop(self, truncation_psi = 0.7, code_handles_in = None, mask = None, rng = None):
+        image, w_code = self.generate_image(truncation_psi = truncation_psi, rng = rng)
+        Image.fromarray(image).save("Original_image.jpg")
+        original_feature_map = self.synthesis_network(w_code, cutoff = self.cutoff_block)
+        self.resized_original_feature_map = jax.image.resize(original_feature_map, shape=(original_feature_map.shape[0], self.resolution, self.resolution, original_feature_map.shape[-1]), method="bilinear")
+        if code_handles_in:
+            pairs = code_handles_in
         else:
-            pi, ti = code_handles_in
-        # original_pi = pi
-        optimizer = optax.adam(2e-3)
+            pairs, mask = utils.get_drag_points(image)
+            with open(r"mask.pkl",'wb') as f:
+                pkl.dump(mask, f)
+            print("Mask saved")
+        
+        if mask is None:
+            mask = jnp.zeros_like(self.resized_original_feature_map[0], dtype=jnp.float32)
+        else:
+            mask = 1 - mask[:,:,None]
+        #self.masked_feature_map = self.resized_original_feature_map[0]*(1 - mask[:,:,None])
+        
+        optimizer = optax.adam(1e-3)
         opt_state = optimizer.init(w_code)
         ctr = 0
-
-        while (abs(pi[0] - ti[0]) + abs(pi[1] - ti[1]) > 4) and ctr < 15:
-            loss, new_w, opt_state = self.optimise_dlatent_single_it(optimizer, opt_state, w_code, pi, ti)
-            print(f"Loss = {loss}         Change in w code: {jnp.linalg.norm(new_w[0] - w_code[0], ord = 1)}")
-            new_point = self.point_tracking(new_w, pi)
-            print(f"({int(new_point[0])}, {int(new_point[1])}) ---- {pi}")
+        P = jnp.array([pair[0] for pair in pairs], dtype=jnp.int32)
+        T = jnp.array([pair[1] for pair in pairs], dtype=jnp.int32)
+        old_points = self.resized_original_feature_map[0,P[:,0],P[:,1],:]
+        r2 = (12 * self.resolution) // 512
+        r1 = (3*self.resolution)//512
+        print(P.tolist().__str__())
+        r2_offsets = jnp.arange(-r2, r2 + 1)
+        r1_offsets = jnp.arange(-r1, r1 + 1)
+        while ctr < 3000 and not self.distance_less_than_threshold(P, T, 2):
+            loss, new_w, opt_state= self.optimise_dlatent_single_it(optimizer, opt_state, w_code, P, T, mask, r1_offsets)
+            new_feature_map = self.synthesis_network(new_w, cutoff=self.cutoff_block)
+            
+            new_P = self.point_tracking(new_feature_map, P, old_points, r2_offsets, r2)
             w_code = new_w
-            pi = (int(new_point[0]), int(new_point[1]))
-            ctr+=1
+            point_str = P.tolist().__str__() + '\n' + new_P.tolist().__str__() + '\n' + T.tolist().__str__() + '\n\n'
+            print(f"{ctr}.  Loss:{loss} \n{point_str}")
+            P = new_P
+            ctr+=1  
+            if ctr%25 == 0:
+                new_image = self.synthesis_network(w_code)[0]
+                new_image = (new_image - jnp.min(new_image)) / (jnp.max(new_image) - jnp.min(new_image))
+                Image.fromarray(np.uint8(new_image * 255)).save(f'image_modified_{ctr}.jpg')
+                
 
         new_image = self.synthesis_network(w_code)[0]
-        feature_map = self.synthesis_network(w_code, cutoff = self.cutoff_block)[0]
-        feature_map = jnp.mean(feature_map, axis=-1)
-        feature_map = (feature_map - jnp.min(feature_map)) / (jnp.max(feature_map) - jnp.min(feature_map))
         new_image = (new_image - jnp.min(new_image)) / (jnp.max(new_image) - jnp.min(new_image))
-        Image.fromarray(image).save("Original_image.jpg")
-        Image.fromarray(np.uint8(new_image * 255)).save('image_modified_down.jpg')
-        Image.fromarray(np.uint8(feature_map * 255), mode='L').save('feature_map.jpg')
-
-
+        Image.fromarray(np.uint8(new_image * 255)).save('image_modified.jpg')
 
 if __name__ == '__main__':
-    model = DragGan()
-    print("Finished instantiating generator at - ", time.time() - start)
-    model.loop(code_handles_in=((233, 372), (233, 481)))
+    model = DragGan(pretrained_dataset = 'afhqwild')
+    model.loop(rng=jrndm.PRNGKey(42))
     
-         
-        
-        
-        
-
-
+    
+ 

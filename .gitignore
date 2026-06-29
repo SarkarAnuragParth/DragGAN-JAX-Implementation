@@ -1,5 +1,5 @@
-﻿docs/thought-dump.md
+weights/
+.jax_cache/
 .vscode/
 **/__pycache__/**
-weights/**
-models/**
+docs/thought-dump.md

@@ -1,0 +1,12 @@
+# Requires Python >=3.11 (jax 0.10.x dropped support for 3.10 and below)
+flax>=0.12.7
+optax>=0.2.8
+jax>=0.10.2
+jaxlib>=0.10.1
+numpy>=1.26
+Pillow>=10.0
+h5py>=3.10
+opencv-python>=4.9
+
+# Patched flaxmodels fork (pinned to specific commit for reproducibility)
+flaxmodels @ git+https://github.com/SarkarAnuragParth/flaxmodels.git@2e1996b0bf137c2d03f3f894bb0d979e196105e5
