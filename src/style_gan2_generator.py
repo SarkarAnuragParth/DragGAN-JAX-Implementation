@@ -1,10 +1,10 @@
 import jax
 import os
 cache_dir = os.path.join(os.getcwd(), ".jax_cache")
-
-# Enable the persistent cache
 jax.config.update("jax_compilation_cache_dir", cache_dir)
+import math
 import flaxmodels.stylegan2 as fstg2
+from flaxmodels.stylegan2.ops import conv2d
 import jax.numpy as jnp
 import flax.nnx as nnx
 import h5py
@@ -29,6 +29,71 @@ def create_kernel_initializer(param_dict, in_features, out_features, lr_multipli
 
 def leaky_relu_alpha_fixed(x: jax.typing.ArrayLike) -> jax.Array:
     return nnx.leaky_relu(x, 0.2)*jnp.sqrt(2)
+
+
+class ModConv2D(nnx.Module):
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        kernel_size: int, 
+        rngs: nnx.Rngs = None,
+        kernel_weights: jax.Array = None,
+        up: bool = False, 
+        down: bool = False, 
+        demodulate: bool = True, 
+        fused_modconv: bool = False
+    ):
+        assert not (up and down)
+        
+        self.out_features = out_features
+        self.up = up
+        self.down = down
+        self.demodulate = demodulate
+        self.fused_modconv = fused_modconv
+
+        if kernel_weights is not None:
+            self.weight = nnx.Param(kernel_weights)
+        else:
+            w_shape = (kernel_size, kernel_size, in_features, out_features)
+            self.weight = nnx.Param(jax.random.normal(rngs.params(), w_shape))
+
+    def __call__(self, x: jax.Array, s: jax.Array, resample_kernel=None) -> jax.Array:
+        w = self.weight.value
+
+        if x.dtype in (jnp.float16, jnp.bfloat16) and not self.fused_modconv and self.demodulate:
+            w *= jnp.sqrt(1 / math.prod(w.shape[:-1])) / jnp.max(jnp.abs(w), axis=(0, 1, 2))
+            
+        ww = w[jnp.newaxis]
+
+        if x.dtype in (jnp.float16, jnp.bfloat16) and not self.fused_modconv and self.demodulate:
+            s *= 1 / jnp.max(jnp.abs(s))
+            
+        ww *= s[:, jnp.newaxis, jnp.newaxis, :, jnp.newaxis].astype(w.dtype)
+
+        if self.demodulate:
+            d = jax.lax.rsqrt(jnp.sum(jnp.square(ww), axis=(1, 2, 3)) + 1e-8)
+            ww *= d[:, jnp.newaxis, jnp.newaxis, jnp.newaxis, :]
+
+        if self.fused_modconv:
+            x = jnp.transpose(x, (0, 3, 1, 2))
+            x = jnp.transpose(jnp.reshape(x, (1, -1, x.shape[2], x.shape[3])), (0, 2, 3, 1))
+            w_conv = jnp.reshape(jnp.transpose(ww, (1, 2, 3, 0, 4)), (ww.shape[1], ww.shape[2], ww.shape[3], -1))
+        else:
+            x *= s[:, jnp.newaxis, jnp.newaxis].astype(x.dtype)
+            w_conv = w.astype(x.dtype)
+
+        # Assumes your custom conv2d is defined in the same scope
+        x = conv2d(x, w_conv, up=self.up, down=self.down, resample_kernel=resample_kernel)
+
+        if self.fused_modconv:
+            x = jnp.transpose(x, (0, 3, 1, 2))
+            x = jnp.transpose(jnp.reshape(x, (-1, self.out_features, x.shape[2], x.shape[3])), (0, 2, 3, 1))
+        elif self.demodulate:
+            x *= d[:, jnp.newaxis, jnp.newaxis].astype(x.dtype)
+        
+        return x
+
 
 class MappingNetwork(nnx.Module):
     def __init__(self, z_dim: int = 512, w_dim: int = 512, hidden_features:int = 512, w_plus_nums: int = 18, pretrained = None, param_dict = None, rngs =  nnx.Rngs(0)):
@@ -62,7 +127,7 @@ class MappingNetwork(nnx.Module):
 
         
     @nnx.jit
-    def __call__(self, z, truncation_psi: float = 1.0, truncation_cutoff:int = 8):
+    def __call__(self, z, truncation_psi: float = 1.0):
         x = fstg2.ops.normalize_2nd_moment(z.astype(jnp.float32))
         x = self.model(x)
         x = jnp.repeat(jnp.expand_dims(x, axis=-2), repeats=self.w_plus, axis=-2)
@@ -104,19 +169,18 @@ class SynthesisLayer(nnx.Module):
         w = utils.equalize_lr_weight(w, lr_multiplier=1.0)
         b = utils.equalize_lr_bias(b, lr_multiplier=1.0)
         self.bias= nnx.Param(b)
-        self.modconv_layer = utils.ModConv2D(n_input_channels,
+        self.modconv_layer = ModConv2D(n_input_channels,
                                              n_output_channels,
                                              3,
                                              kernel_weights=w,
                                              up = up,
                                              fused_modconv=True)
         
-       # @nnx.jit
+
     def __call__(self, x, dlatents, resample_kernel = (1,3,3,1), rng = None):
         
         s = self.style_embedding_layer(dlatents[:, self.layer_idx])
         x = self.modconv_layer(x, s, resample_kernel)
-        # noise = jax.random.normal(rng.params(), shape=(x.shape[0], x.shape[1], x.shape[2], 1), dtype=x.dtype)
         x += self.noise_const.astype(jnp.float32) * self.noise_strength.astype(jnp.float32)
         x += self.bias.astype(x.dtype)
         x = nnx.leaky_relu(x, 0.2)
@@ -155,7 +219,7 @@ class ToRGBLayer(nnx.Module):
         self.bias = nnx.Param(b)
         
         # CRITICAL: demodulate=False for ToRGB layers
-        self.modconv_layer = utils.ModConv2D(
+        self.modconv_layer = ModConv2D(
             in_features=n_input_channels,
             out_features=fmaps,
             kernel_size=kernel_size,
@@ -170,9 +234,6 @@ class ToRGBLayer(nnx.Module):
         x = self.modconv_layer(x, s)
         x += self.bias.astype(x.dtype)
         
-        # Linear activation -> No activation function applied
-        
-        # Add residual RGB accumulation from the previous layer
         if y is not None:
             x += y.astype(x.dtype)
             
@@ -235,14 +296,10 @@ class SynthesisBlock(nnx.Module):
         for layer in self.layers:
             x = layer(x, dlatents, resample_kernel=resample_kernel, rng = rng)
             
-        # 2. Upsample the incoming RGB image from the previous block
-        # (Only upsample if this isn't the base 4x4 block, and if we actually have a previous image)
         if y is not None and self.res != 2:
-            # Assuming your fstg2.ops library holds setup_filter and upsample2d
             k = fstg2.ops.setup_filter(resample_kernel)
             y = fstg2.ops.upsample2d(y, f=k, up=2)
             
-        # 3. Generate new RGB contributions and accumulate with the upsampled previous image
         y = self.torgb(x, y, dlatents)
         
         return x, y
@@ -300,8 +357,6 @@ class SynthesisNetwork(nnx.Module):
             )
             curr_in_channels = block_fmaps
 
-    # If you JIT this at the top level, cutoff MUST be a static argument 
-    # because it dynamically changes the return shape and type (y is RGB, x is feature map)
     @nnx.jit(static_argnames='cutoff')
     def __call__(self, dlatents: jax.Array, cutoff: int = None, resample_kernel=(1, 3, 3, 1), rng=nnx.Rngs(0)):
         batch_size = dlatents.shape[0]

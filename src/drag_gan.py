@@ -22,8 +22,7 @@ class DragGan(nnx.Module):
         self.lamda = 20
         self.w_cutoff = w_cutoff
 
-    def get_dlatent_loss(self, w_code, P, T, mask, offsets):
-
+    def forward_pass(self, w_code, P, T, mask, offsets):
         feature_map = self.synthesis_network(w_code, cutoff = self.cutoff_block)
         resized_map = jax.image.resize(feature_map, shape=(feature_map.shape[0], self.resolution, self.resolution, feature_map.shape[-1]), method="bilinear")
         loss = self.motion_supervision_loss(resized_map, P, T, offsets)
@@ -36,7 +35,7 @@ class DragGan(nnx.Module):
     @nnx.jit(static_argnames=['optimizer'])
     def optimise_dlatent_single_it(self, optimizer: optax.GradientTransformationExtraArgs, opt_state, w_code, P, T, mask, offsets):
 
-        loss, grads = nnx.value_and_grad(DragGan.get_dlatent_loss,
+        loss, grads = nnx.value_and_grad(DragGan.forward_pass,
                                                         argnums = 1,
                                                         has_aux = False)(self, w_code, P, T, mask, offsets)
         updates, new_opt_state = optimizer.update(grads, opt_state)
@@ -82,7 +81,7 @@ class DragGan(nnx.Module):
 
 
     @nnx.jit
-    def motion_supervision_loss(self, resized_map, P, T,offsets):
+    def motion_supervision_loss(self, resized_map, P, T, offsets):
         
         n_points = P.shape[0]
         P_x, P_y = P[:,0], P[:,1]
@@ -151,7 +150,7 @@ class DragGan(nnx.Module):
         return jnp.all((jnp.abs(P[:,0] - T[:,0]) + jnp.abs(P[:,1] - T[:,1])) < threshold)
 
 
-    def loop(self, truncation_psi = 0.7, code_handles_in = None, mask = None, rng = None):
+    def entry(self, truncation_psi = 0.7, code_handles_in = None, mask = None, rng = None, save_image_every_k_it: int = 50):
         image, w_code = self.generate_image(truncation_psi = truncation_psi, rng = rng)
         Image.fromarray(image).save("Original_image.jpg")
         original_feature_map = self.synthesis_network(w_code, cutoff = self.cutoff_block)
@@ -168,7 +167,6 @@ class DragGan(nnx.Module):
             mask = jnp.zeros_like(self.resized_original_feature_map[0], dtype=jnp.float32)
         else:
             mask = 1 - mask[:,:,None]
-        #self.masked_feature_map = self.resized_original_feature_map[0]*(1 - mask[:,:,None])
         
         optimizer = optax.adam(1e-3)
         opt_state = optimizer.init(w_code)
@@ -178,10 +176,9 @@ class DragGan(nnx.Module):
         old_points = self.resized_original_feature_map[0,P[:,0],P[:,1],:]
         r2 = (12 * self.resolution) // 512
         r1 = (3*self.resolution)//512
-        print(P.tolist().__str__())
         r2_offsets = jnp.arange(-r2, r2 + 1)
         r1_offsets = jnp.arange(-r1, r1 + 1)
-        while ctr < 3000 and not self.distance_less_than_threshold(P, T, 2):
+        while not self.distance_less_than_threshold(P, T, 2):
             loss, new_w, opt_state= self.optimise_dlatent_single_it(optimizer, opt_state, w_code, P, T, mask, r1_offsets)
             new_feature_map = self.synthesis_network(new_w, cutoff=self.cutoff_block)
             
@@ -191,7 +188,7 @@ class DragGan(nnx.Module):
             print(f"{ctr}.  Loss:{loss} \n{point_str}")
             P = new_P
             ctr+=1  
-            if ctr%25 == 0:
+            if ctr%save_image_every_k_it == 0:
                 new_image = self.synthesis_network(w_code)[0]
                 new_image = (new_image - jnp.min(new_image)) / (jnp.max(new_image) - jnp.min(new_image))
                 Image.fromarray(np.uint8(new_image * 255)).save(f'image_modified_{ctr}.jpg')
@@ -202,8 +199,8 @@ class DragGan(nnx.Module):
         Image.fromarray(np.uint8(new_image * 255)).save('image_modified.jpg')
 
 if __name__ == '__main__':
-    model = DragGan(pretrained_dataset = 'afhqwild')
-    model.loop(rng=jrndm.PRNGKey(42))
+    model = DragGan(pretrained_dataset = 'ffhq')
+    model.entry(rng=jrndm.PRNGKey(971))
     
     
  
