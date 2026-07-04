@@ -3,3 +3,5 @@ weights/
 .vscode/
 **/__pycache__/**
 docs/thought-dump.md
+todos.txt
+mask.pkl
